@@ -1,8 +1,18 @@
-version: '3.7'
+version: '3.9'
+
+x-healthcheck: &default-healthcheck
+  test: [ "CMD", "echo", "true"]
+  interval: 10s
+  timeout: 60s
+  retries: 5
+  start_period: 20s
 
 volumes:
-    prometheus_data: {}
-    grafana_data: {}
+  prometheus_data: &volume_defaults
+    driver: default
+  grafana_data: *volume_defaults
+  alertmanager_data: *volume_defaults
+  loki_wal: *volume_defaults
 
 networks:
   front-tier:
@@ -11,165 +21,211 @@ networks:
 services:
 
   prometheus:
-    image: prom/prometheus:v2.36.2
+    container_name: prometheus
+    image: prom/prometheus:v2.42.0
     volumes:
-      - ./prometheus/:/etc/prometheus/
-      - prometheus_data:/prometheus
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus:rw
+    environment:
+      - EXTERNAL_URL=${EXTERNAL_URL}
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=366d'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
+      - "--web.external-url=${EXTERNAL_URL}"
     ports:
-      - 9090:9090
+      - protocol: tcp
+        published: 9090
+        target: 9090
     links:
-      - cadvisor:cadvisor
       - alertmanager:alertmanager
-#      - pushgateway:pushgateway
+      - pushgateway:pushgateway
+      - pve-exporter:pve-exporter
+      - mktxp:mktxp
+      - promtail:promtail
+      - loki:loki
     depends_on:
-      - cadvisor
-#      - pushgateway
+      pushgateway: &healthy_service
+        condition: service_healthy
+      alertmanager: *healthy_service
+      pve-exporter: *healthy_service
+      mktxp: *healthy_service
+      promtail: *healthy_service
+      loki: *healthy_service
+      syslog-ng: *healthy_service
     networks:
       - back-tier
+    healthcheck: 
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "wget -t1 -q -O - http://prometheus:9090/-/healthy | grep Healthy"]
     restart: always
-#    deploy:
-#      placement:
-#        constraints:
-#          - node.hostname == ${HOSTNAME}
 
-  node-exporter:
-    image: quay.io/prometheus/node-exporter:latest
+  alertmanager-init:
+    container_name: alertinit
+    image: dinutac/jinja2docker:2.1.6
+    hostname: jinja2docker
+    entrypoint: ""
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_POOPTOOTH_TOKEN}
+      - TELEGRAM_BOT_NAME=${TELEGRAM_POOPTOOTH_CHAT_ID}
     volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-      - /:/host:ro,rslave
-    command: 
-      - '--path.rootfs=/host'
-      - '--path.procfs=/host/proc' 
-      - '--path.sysfs=/host/sys'
-      - --collector.filesystem.ignored-mount-points
-      - "^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)"
-    ports:
-      - 9100:9100
-    networks:
-      - back-tier
-    restart: always
-    deploy:
-      mode: global
+      - ./alertmanager/templates:/templates:ro
+      - ./alertmanager/config:/output:rw
+    command: "jinja2 /templates/config.yml.j2 --format=yaml -o /output/config.yml"
 
   alertmanager:
-    image: prom/alertmanager
+    container_name: alertmanager
+    image: prom/alertmanager:v0.25.0
     ports:
-      - 9093:9093
+      - protocol: tcp
+        published: 9093
+        target: 9093
     volumes:
-      - ./alertmanager/:/etc/alertmanager/
+      - ./alertmanager/config:/etc/alertmanager/config:ro
+      - ./alertmanager/alert-templates:/etc/alertmanager/templates:ro
+      - alertmanager_data:/alertmanager:rw
     networks:
       - back-tier
     restart: always
     command:
-      - '--config.file=/etc/alertmanager/config.yml'
+      - '--config.file=/etc/alertmanager/config/config.yml'
       - '--storage.path=/alertmanager'
-#    deploy:
-#      placement:
-#        constraints:
-#          - node.hostname == ${HOSTNAME}
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:rw
-      - /sys:/sys:ro
-      - /var/lib/docker/:/var/lib/docker:ro
-    ports:
-      - 8080:8080
-    networks:
-      - back-tier
-    restart: always
-    deploy:
-      mode: global
+    depends_on:
+      alertmanager-init:
+        condition: service_completed_successfully
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "wget -t1 -q -O - http://alertmanager:9093/api/v2/status | grep ready"]
 
   grafana:
-    image: grafana/grafana
+    container_name: grafana
+    image: grafana/grafana:9.3.6
     user: "472"
     depends_on:
-      - prometheus
+      prometheus: *healthy_service
     ports:
-      - 3000:3000
+      - protocol: tcp
+        published: 3000
+        target: 3000
     volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning/:/etc/grafana/provisioning/
+      - grafana_data:/var/lib/grafana:rw
+      - ./grafana/provisioning:/etc/grafana/provisioning:rw
     env_file:
       - ./grafana/config.monitoring
     networks:
       - back-tier
       - front-tier
     restart: always
+    links:
+      - loki:loki
+      - alertmanager:alertmanager
+      - prometheus:prometheus
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "wget -t1 -q -O - http://grafana:3000/api/health | grep ok"]
 
-#  pushgateway:
-#    image: prom/pushgateway
-#    restart: always
-#    expose:
-#      - 9091
-#    ports:
-#      - "9091:9091"
-#    networks:
-#      - back-tier
-#
+  pushgateway:
+    container_name: pushgateway
+    image: prom/pushgateway:v1.5.1
+    restart: always
+    # ports:
+    #   - protocol: tcp
+    #     published: 9091
+    #     target: 9091
+    networks:
+      - back-tier
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "wget -t1 -q -O - http://pushgateway:9091/-/ready | grep OK"]
+
+  pve-exporter:
+    container_name: pve-exporter
+    image: prompve/prometheus-pve-exporter:2.2.4
+    restart: always
+    env_file:
+      - .env
+    # ports:
+    #   - protocol: tcp
+    #     published: 9221
+    #     target: 9221
+    networks:
+      - back-tier
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "wget -t1 -q -O - http://pve-exporter:9221/ | grep target"]
+
   mktxp:
     container_name: mktxp
     image: guenterbailey/mktxp:latest
     user: root
     volumes:
-      - './mktxp/:/root/mktxp/'
+      - './mktxp:/root/mktxp'
     networks:
       - back-tier
     restart: unless-stopped
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "mktxp", "show"]
+
   promtail:
     command: -config.file=/etc/promtail/promtail-config.yml
     container_name: promtail
-    image: grafana/promtail:2.3.0
+    image: grafana/promtail:2.7.3
     networks:
       - back-tier
-    ports:
-    - protocol: tcp
-      published: 1514
-      target: 1514
-    - protocol: tcp
-      published: 9080
-      target: 9080
+    links:
+      - loki:loki
+      - syslog-ng:syslog-ng
+    # ports:
+    #   - protocol: tcp
+    #     published: 1514
+    #     target: 1514
+    #   - protocol: tcp
+    #     published: 9080
+    #     target: 9080
     restart: always
     volumes:
-    - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - ./promtail:/etc/promtail:ro
+    healthcheck:
+      <<: *default-healthcheck
 
   syslog-ng:
     command: -edv
     container_name: syslog-ng
-    depends_on:
-    - promtail
-    image: balabit/syslog-ng:latest
+    image: balabit/syslog-ng:4.0.1
     networks:
       - back-tier
     ports:
-    - protocol: udp
-      published: 514
-      target: 514
-    - protocol: tcp
-      published: 601
-      target: 601
+      - protocol: udp
+        published: 514
+        target: 514
+      - protocol: tcp
+        published: 601
+        target: 601
     restart: always
     volumes:
-    - ./syslog-ng/syslog-ng.conf:/etc/syslog-ng/syslog-ng.conf:ro
+      - ./syslog-ng:/etc/syslog-ng:rw
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD", "/usr/sbin/syslog-ng-ctl", "stats"]
+
   loki:
+    user: root
     command: -config.file=/etc/loki/loki-config.yml
     container_name: loki
-    image: grafana/loki:2.3.0
+    image: grafana/loki:2.7.3
     networks:
-      - back-tier
-    ports:
-    - protocol: tcp
-      published: 3100
-      target: 3100
+      - back-tier     
+    # ports:
+    #   - protocol: tcp
+    #     published: 3100
+    #     target: 3100
     restart: always
     volumes:
-    - ./loki/loki-config.yml:/etc/loki/loki-config.yml
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_wal:/wal:rw
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "wget -t1 -q -O - http://loki:3100/ready | grep ready"]
