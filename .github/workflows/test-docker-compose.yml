@@ -1,0 +1,361 @@
+name: Test Docker Compose Stack
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'docker-compose.yml'
+      - 'prometheus/**'
+      - 'grafana/**'
+      - 'alertmanager/**'
+      - 'loki/**'
+      - 'promtail/**'
+      - 'syslog-ng/**'
+      - 'mktxp/**'
+      - '.github/workflows/test-docker-compose.yml'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'docker-compose.yml'
+      - 'prometheus/**'
+      - 'grafana/**'
+      - 'alertmanager/**'
+      - 'loki/**'
+      - 'promtail/**'
+      - 'syslog-ng/**'
+      - 'mktxp/**'
+  workflow_dispatch:
+    inputs:
+      cleanup:
+        description: 'Clean up containers after test'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  COMPOSE_PROJECT_NAME: hell-compose-monitor-test
+  COMPOSE_FILE: docker-compose.yml
+
+jobs:
+  test-stack:
+    name: Test Complete Monitoring Stack
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Docker and Docker Compose availability
+        run: |
+          echo "=== Docker Version ==="
+          docker --version
+          echo ""
+          echo "=== Docker Compose Version ==="
+          docker compose version
+          echo ""
+          echo "=== Available disk space ==="
+          df -h
+
+      - name: Create test environment file
+        run: |
+          cat > .env << EOF
+          # Test environment configuration
+          TELEGRAM_POOPTOOTH_CHAT_ID=-1234567890
+          TELEGRAM_POOPTOOTH_TOKEN=1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ0123456789
+          PVE_USER=test@pve
+          PVE_PASSWORD=testpassword
+          PVE_VERIFY_SSL=false
+          EXTERNAL_URL=http://localhost:9090/
+          EOF
+          echo "✓ Created test .env file"
+
+      - name: Pull all Docker images
+        run: |
+          echo "=== Pulling Docker images ==="
+          docker compose pull
+        timeout-minutes: 10
+
+      - name: Start Docker Compose stack
+        run: |
+          echo "=== Starting all services ==="
+          docker compose up -d
+          echo "✓ Services started"
+          echo ""
+          echo "=== Running containers ==="
+          docker compose ps
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "=== Waiting for services to become healthy ==="
+          
+          # Function to check service health
+          check_health() {
+            local service=$1
+            local max_attempts=60
+            local attempt=1
+            
+            echo "Checking $service..."
+            while [ $attempt -le $max_attempts ]; do
+              status=$(docker compose ps $service --format json | jq -r '.[0].Health // "unknown"')
+              
+              if [ "$status" = "healthy" ]; then
+                echo "✓ $service is healthy"
+                return 0
+              fi
+              
+              echo "  Attempt $attempt/$max_attempts: $service status is '$status'"
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+            
+            echo "✗ $service failed to become healthy within timeout"
+            return 1
+          }
+          
+          # Wait for critical services
+          failed=0
+          check_health prometheus || failed=1
+          check_health alertmanager || failed=1
+          check_health grafana || failed=1
+          check_health loki || failed=1
+          check_health promtail || failed=1
+          check_health syslog-ng || failed=1
+          check_health pushgateway || failed=1
+          
+          if [ $failed -eq 1 ]; then
+            echo ""
+            echo "=== Service logs for debugging ==="
+            docker compose logs --tail=50
+            exit 1
+          fi
+          
+          echo ""
+          echo "✓ All critical services are healthy"
+        timeout-minutes: 10
+
+      - name: Test Prometheus
+        run: |
+          echo "=== Testing Prometheus ==="
+          
+          # Test Prometheus API
+          echo "Testing Prometheus health endpoint..."
+          response=$(curl -s http://localhost:9090/-/healthy)
+          if echo "$response" | grep -q "Healthy"; then
+            echo "✓ Prometheus is healthy"
+          else
+            echo "✗ Prometheus health check failed"
+            exit 1
+          fi
+          
+          # Test Prometheus targets
+          echo "Testing Prometheus targets..."
+          curl -s http://localhost:9090/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job): \(.health)"' || true
+          
+          # Test Prometheus query
+          echo "Testing Prometheus query API..."
+          curl -s 'http://localhost:9090/api/v1/query?query=up' | jq -r '.status' | grep -q "success" && echo "✓ Query API working" || echo "✗ Query API failed"
+
+      - name: Test Alertmanager
+        run: |
+          echo "=== Testing Alertmanager ==="
+          
+          # Test Alertmanager API
+          echo "Testing Alertmanager status..."
+          response=$(curl -s http://localhost:9093/api/v2/status)
+          if echo "$response" | grep -q "ready"; then
+            echo "✓ Alertmanager is ready"
+          else
+            echo "✗ Alertmanager status check failed"
+            exit 1
+          fi
+          
+          # Test Alertmanager alerts endpoint
+          echo "Testing alerts endpoint..."
+          curl -s http://localhost:9093/api/v2/alerts | jq -r 'length' && echo "✓ Alerts endpoint working" || echo "✗ Alerts endpoint failed"
+
+      - name: Test Grafana
+        run: |
+          echo "=== Testing Grafana ==="
+          
+          # Test Grafana health
+          echo "Testing Grafana health endpoint..."
+          response=$(curl -s http://localhost:3000/api/health)
+          if echo "$response" | grep -q "ok"; then
+            echo "✓ Grafana is healthy"
+          else
+            echo "✗ Grafana health check failed"
+            exit 1
+          fi
+          
+          # Test Grafana datasources
+          echo "Testing Grafana datasources..."
+          curl -s http://localhost:3000/api/datasources | jq -r '.[] | "\(.name): \(.type)"' || echo "No datasources configured yet (this is expected for initial setup)"
+
+      - name: Test Loki
+        run: |
+          echo "=== Testing Loki ==="
+          
+          # Test Loki ready endpoint
+          echo "Testing Loki ready endpoint..."
+          response=$(curl -s http://localhost:3100/ready)
+          if echo "$response" | grep -q "ready"; then
+            echo "✓ Loki is ready"
+          else
+            echo "✗ Loki ready check failed"
+            exit 1
+          fi
+          
+          # Test Loki metrics
+          echo "Testing Loki metrics endpoint..."
+          curl -s http://localhost:3100/metrics | head -5 && echo "✓ Metrics endpoint working" || echo "✗ Metrics endpoint failed"
+
+      - name: Test Pushgateway
+        run: |
+          echo "=== Testing Pushgateway ==="
+          
+          # Test Pushgateway ready endpoint
+          echo "Testing Pushgateway..."
+          response=$(curl -s http://localhost:9091/-/ready)
+          if echo "$response" | grep -q "OK"; then
+            echo "✓ Pushgateway is ready"
+          else
+            echo "✗ Pushgateway ready check failed"
+            exit 1
+          fi
+
+      - name: Verify service dependencies
+        run: |
+          echo "=== Verifying service dependencies ==="
+          
+          # Check that Prometheus can see all expected targets
+          echo "Checking Prometheus targets..."
+          targets=$(curl -s http://localhost:9090/api/v1/targets | jq -r '.data.activeTargets | length')
+          echo "Active targets: $targets"
+          
+          if [ "$targets" -gt 0 ]; then
+            echo "✓ Prometheus has active targets"
+          else
+            echo "⚠ Prometheus has no active targets (may need time to discover)"
+          fi
+          
+          # Verify network connectivity between services
+          echo ""
+          echo "Checking inter-service connectivity..."
+          docker compose exec -T prometheus wget -q -O - http://alertmanager:9093/api/v2/status > /dev/null && echo "✓ Prometheus → Alertmanager" || echo "✗ Prometheus → Alertmanager failed"
+          docker compose exec -T prometheus wget -q -O - http://loki:3100/ready > /dev/null && echo "✓ Prometheus → Loki" || echo "✗ Prometheus → Loki failed"
+
+      - name: Check logs for errors
+        if: always()
+        run: |
+          echo "=== Checking logs for critical errors ==="
+          
+          # Check for common error patterns
+          if docker compose logs | grep -i "fatal\|panic\|error.*failed" | grep -v "level=error msg=\"Notify for alerts failed\""; then
+            echo "⚠ Found errors in logs (review above)"
+          else
+            echo "✓ No critical errors found in logs"
+          fi
+
+      - name: Display service status
+        if: always()
+        run: |
+          echo "=== Final Service Status ==="
+          docker compose ps
+          echo ""
+          echo "=== Resource Usage ==="
+          docker stats --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"
+
+      - name: Export logs on failure
+        if: failure()
+        run: |
+          echo "=== Exporting logs for debugging ==="
+          mkdir -p test-logs
+          docker compose logs > test-logs/docker-compose.log
+          docker compose ps --format json > test-logs/services-status.json
+          docker compose config > test-logs/resolved-compose.yml
+          echo "Logs exported to test-logs/"
+
+      - name: Upload logs as artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.run_number }}
+          path: test-logs/
+          retention-days: 7
+
+      - name: Stop and remove containers
+        if: always() && (github.event.inputs.cleanup != 'false')
+        run: |
+          echo "=== Stopping services ==="
+          docker compose down -v
+          echo "✓ Services stopped and volumes removed"
+          
+          # Clean up test environment file
+          rm -f .env
+          echo "✓ Test environment cleaned up"
+
+      - name: Clean up dangling images
+        if: always() && (github.event.inputs.cleanup != 'false')
+        run: |
+          echo "=== Cleaning up dangling images ==="
+          docker image prune -f || true
+          echo "✓ Cleanup completed"
+
+  security-scan:
+    name: Security Scan Docker Images
+    runs-on: self-hosted
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract image list from docker-compose
+        id: images
+        run: |
+          echo "=== Extracting images from docker-compose.yml ==="
+          images=$(docker compose config | grep 'image:' | awk '{print $2}' | sort -u)
+          echo "$images"
+          echo "images<<EOF" >> $GITHUB_OUTPUT
+          echo "$images" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Pull images for scanning
+        run: |
+          echo "=== Pulling images for security scan ==="
+          docker compose pull
+
+      - name: Scan images with Trivy (if available)
+        continue-on-error: true
+        run: |
+          if command -v trivy &> /dev/null; then
+            echo "=== Scanning images with Trivy ==="
+            mkdir -p scan-results
+            
+            while IFS= read -r image; do
+              if [ -n "$image" ]; then
+                echo "Scanning $image..."
+                trivy image --severity HIGH,CRITICAL --format table "$image" || true
+              fi
+            done <<< "${{ steps.images.outputs.images }}"
+          else
+            echo "⚠ Trivy not installed, skipping vulnerability scan"
+            echo "Install Trivy for security scanning: https://aquasecurity.github.io/trivy/"
+          fi
+
+      - name: Security scan summary
+        run: |
+          echo "=== Security Scan Summary ==="
+          echo "Images scanned: $(echo '${{ steps.images.outputs.images }}' | wc -l)"
+          echo ""
+          echo "For detailed security analysis, see:"
+          echo "- SECURITY_CHECKLIST.md in the repository"
+          echo "- SBOM files in sbom/ directory (generate with: syft <image> -o spdx-json)"
