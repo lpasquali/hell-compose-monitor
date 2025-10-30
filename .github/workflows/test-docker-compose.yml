@@ -81,7 +81,7 @@ jobs:
         run: |
           echo "=== Pulling Docker images ==="
           docker compose pull
-        timeout-minutes: 10
+        timeout-minutes: 30
 
       - name: Start Docker Compose stack
         run: |
