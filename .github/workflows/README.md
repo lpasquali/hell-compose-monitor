@@ -1,10 +1,79 @@
 # GitHub Actions Workflows
 
-This directory contains GitHub Actions workflows for automated testing and validation of the monitoring stack.
+This directory contains GitHub Actions workflows for automated testing, deployment, and management of the monitoring stack.
 
 ## Available Workflows
 
-### Test Docker Compose Stack (`test-docker-compose.yml`)
+### 1. Deploy Monitoring Stack (`deploy-monitoring-stack.yml`)
+
+Production-ready deployment workflow for running the complete monitoring stack on self-hosted nodes.
+
+#### Features
+
+**Deployment Management:**
+- 🚀 Deploy/restart/stop monitoring stack
+- 🔄 Force recreate containers option
+- 🌍 Multi-environment support (production, staging, development)
+- 💾 Automatic backup before production deployments
+- ✅ Health checks and verification
+- 📊 Post-deployment status reporting
+
+**Safety Features:**
+- Pre-deployment prerequisite checks
+- Environment file validation
+- Automatic data volume backups (production)
+- Graceful service shutdown
+- Resource usage monitoring
+
+#### Usage
+
+**Manual Deployment:**
+1. Go to Actions tab → "Deploy Monitoring Stack"
+2. Click "Run workflow"
+3. Select:
+   - **Environment:** production/staging/development
+   - **Action:** deploy/restart/stop/status
+   - **Force recreate:** true/false
+4. Click "Run workflow"
+
+**Available Actions:**
+- **deploy:** Pull images, stop existing stack, start fresh deployment
+- **restart:** Restart the monitoring stack
+- **stop:** Stop all services
+- **status:** Check current deployment status
+
+**Environments:**
+- **production:** Full backups, strict validation
+- **staging:** Testing environment
+- **development:** Development environment
+
+#### Requirements
+
+- Self-hosted runner with Docker Compose V2
+- `.env` file configured with credentials
+- 20GB+ disk space
+- For production: `/var/backups/hell-compose-monitor/` directory
+
+#### Workflow Steps
+
+1. **Verification:** Check Docker, Compose, disk space, .env
+2. **Backup:** (Production only) Backup Prometheus and Grafana volumes
+3. **Pull:** Download latest images
+4. **Deploy:** Stop old stack, start new services
+5. **Health Checks:** Wait for services to be healthy
+6. **Verification:** Test endpoints, check logs
+7. **Report:** Display access info and resource usage
+
+#### Access After Deployment
+
+The workflow displays access URLs for:
+- **Prometheus:** Port 9090
+- **Grafana:** Port 3000 (admin/admin)
+- **Alertmanager:** Port 9093
+
+---
+
+### 2. Test Docker Compose Stack (`test-docker-compose.yml`)
 
 Comprehensive testing workflow for the complete monitoring stack using Docker Compose on self-hosted runners.
 
