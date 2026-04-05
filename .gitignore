@@ -1,1 +1,4 @@
 .vscode/launch.json
+
+# SBOM files (large, can be regenerated)
+sbom/*.json
